@@ -42,14 +42,18 @@ struct SchedulerThread {
 typedef duckdb_moodycamel::LightweightSemaphore lightweight_semaphore_t;
 
 struct ConcurrentQueue {
-	ConcurrentQueue() : tasks_in_queue(0), last_boost_time(std::chrono::steady_clock::now()) {
+	ConcurrentQueue() : tasks_in_queue(0) {
 	}
 
 	lightweight_semaphore_t semaphore;
 
 	// MLFQ: three priority levels
 	// Q0 = high priority (new queries), Q1 = medium, Q2 = low (long-running)
-	using TaskEntry = pair<ProducerToken *, shared_ptr<Task>>;
+	struct TaskEntry {
+		ProducerToken *producer;
+		shared_ptr<Task> task;
+		std::chrono::steady_clock::time_point enqueue_time;
+	};
 	std::deque<TaskEntry> q0;
 	std::deque<TaskEntry> q1;
 	std::deque<TaskEntry> q2;
@@ -60,9 +64,8 @@ struct ConcurrentQueue {
 	static constexpr idx_t Q0_THRESHOLD = 50;
 	static constexpr idx_t Q1_THRESHOLD = 500;
 
-	// Starvation prevention: boost all queries back to Q0 every interval
-	static constexpr int64_t BOOST_INTERVAL_MS = 1000; // 1 second
-	std::chrono::steady_clock::time_point last_boost_time;
+	// Aging threshold: promote a task if it has waited longer than this
+	static constexpr int64_t AGING_THRESHOLD_MS = 500; // 500ms
 
 	// Per-query state: morsel counts and current priority level
 	unordered_map<uint64_t, idx_t> query_morsel_counts;
@@ -85,29 +88,28 @@ private:
 		return (it != query_priority_levels.end()) ? it->second : 0;
 	}
 
-	// Boost all demoted tasks back to Q0 to prevent starvation.
+	// Aging: promote only the specific tasks that have waited too long.
 	// Must be called with queue_lock held.
-	void BoostIfNeeded() {
+	void AgeTasks() {
 		auto now = std::chrono::steady_clock::now();
-		auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_boost_time).count();
-		if (elapsed < BOOST_INTERVAL_MS) {
-			return;
+		// Check front of Q1
+		if (!q1.empty()) {
+			auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(now - q1.front().enqueue_time).count();
+			if (wait >= AGING_THRESHOLD_MS) {
+				q1.front().task->priority_level = 0;
+				q0.push_back(std::move(q1.front()));
+				q1.pop_front();
+			}
 		}
-		// Move all Q1 and Q2 tasks back to Q0
-		for (auto &entry : q1) {
-			entry.second->priority_level = 0;
-			q0.push_back(std::move(entry));
+		// Check front of Q2
+		if (!q2.empty()) {
+			auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(now - q2.front().enqueue_time).count();
+			if (wait >= AGING_THRESHOLD_MS) {
+				q2.front().task->priority_level = 0;
+				q0.push_back(std::move(q2.front()));
+				q2.pop_front();
+			}
 		}
-		q1.clear();
-		for (auto &entry : q2) {
-			entry.second->priority_level = 0;
-			q0.push_back(std::move(entry));
-		}
-		q2.clear();
-		// Reset per-query state so queries get a fresh start
-		query_morsel_counts.clear();
-		query_priority_levels.clear();
-		last_boost_time = now;
 	}
 
 	atomic<idx_t> tasks_in_queue;
@@ -131,12 +133,13 @@ void ConcurrentQueue::Enqueue(ProducerToken &token, shared_ptr<Task> task) {
 		lock_guard<mutex> lock(queue_lock);
 		int level = GetQueryLevelLocked(qid);
 		task->priority_level = level;
+		TaskEntry entry = {&token, std::move(task), std::chrono::steady_clock::now()};
 		if (level == 0) {
-			q0.push_back({&token, std::move(task)});
+			q0.push_back(std::move(entry));
 		} else if (level == 1) {
-			q1.push_back({&token, std::move(task)});
+			q1.push_back(std::move(entry));
 		} else {
-			q2.push_back({&token, std::move(task)});
+			q2.push_back(std::move(entry));
 		}
 		++tasks_in_queue;
 	}
@@ -154,12 +157,13 @@ void ConcurrentQueue::EnqueueBulk(ProducerToken &token, vector<shared_ptr<Task>>
 		uint64_t qid = task->query_id;
 		int level = GetQueryLevelLocked(qid);
 		task->priority_level = level;
+		TaskEntry entry = {&token, std::move(task), std::chrono::steady_clock::now()};
 		if (level == 0) {
-			q0.push_back({&token, std::move(task)});
+			q0.push_back(std::move(entry));
 		} else if (level == 1) {
-			q1.push_back({&token, std::move(task)});
+			q1.push_back(std::move(entry));
 		} else {
-			q2.push_back({&token, std::move(task)});
+			q2.push_back(std::move(entry));
 		}
 	}
 	tasks_in_queue += tasks.size();
@@ -171,8 +175,8 @@ bool ConcurrentQueue::DequeueFromProducer(ProducerToken &token, shared_ptr<Task>
 	// Search priority queues in order, returning only tasks from this producer
 	for (auto *q : {&q0, &q1, &q2}) {
 		for (auto it = q->begin(); it != q->end(); ++it) {
-			if (it->first == &token) {
-				task = std::move(it->second);
+			if (it->producer == &token) {
+				task = std::move(it->task);
 				q->erase(it);
 				--tasks_in_queue;
 				return true;
@@ -184,22 +188,22 @@ bool ConcurrentQueue::DequeueFromProducer(ProducerToken &token, shared_ptr<Task>
 
 bool ConcurrentQueue::Dequeue(shared_ptr<Task> &task) {
 	lock_guard<mutex> lock(queue_lock);
-	BoostIfNeeded(); // prevent starvation of long-running queries
+	AgeTasks(); // promote individual starving tasks before dequeuing
 	// Always serve highest priority queue first
 	if (!q0.empty()) {
-		task = std::move(q0.front().second);
+		task = std::move(q0.front().task);
 		q0.pop_front();
 		--tasks_in_queue;
 		return true;
 	}
 	if (!q1.empty()) {
-		task = std::move(q1.front().second);
+		task = std::move(q1.front().task);
 		q1.pop_front();
 		--tasks_in_queue;
 		return true;
 	}
 	if (!q2.empty()) {
-		task = std::move(q2.front().second);
+		task = std::move(q2.front().task);
 		q2.pop_front();
 		--tasks_in_queue;
 		return true;
@@ -237,7 +241,7 @@ idx_t ConcurrentQueue::GetTaskCountForProducer(ProducerToken &token) const {
 	idx_t count = 0;
 	for (auto *q : {&q0, &q1, &q2}) {
 		for (auto &entry : *q) {
-			if (entry.first == &token) {
+			if (entry.producer == &token) {
 				count++;
 			}
 		}
