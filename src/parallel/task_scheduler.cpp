@@ -42,7 +42,7 @@ struct SchedulerThread {
 typedef duckdb_moodycamel::LightweightSemaphore lightweight_semaphore_t;
 
 struct ConcurrentQueue {
-	ConcurrentQueue() : tasks_in_queue(0) {
+	ConcurrentQueue() : tasks_in_queue(0), dequeue_count(0) {
 	}
 
 	lightweight_semaphore_t semaphore;
@@ -58,14 +58,22 @@ struct ConcurrentQueue {
 	std::deque<TaskEntry> q1;
 	std::deque<TaskEntry> q2;
 
+	// Separate locks to reduce contention:
+	// queue_lock: protects q0/q1/q2 deques
+	// state_lock: protects morsel counts and priority levels
 	mutable mutex queue_lock;
+	mutable mutex state_lock;
 
 	// Demotion thresholds (completed morsels before moving to next level)
-	static constexpr idx_t Q0_THRESHOLD = 50;
-	static constexpr idx_t Q1_THRESHOLD = 500;
+	// Raised to avoid over-eager demotion under heavy load
+	static constexpr idx_t Q0_THRESHOLD = 200;
+	static constexpr idx_t Q1_THRESHOLD = 2000;
 
 	// Aging threshold: promote a task if it has waited longer than this
-	static constexpr int64_t AGING_THRESHOLD_MS = 500; // 500ms
+	static constexpr int64_t AGING_THRESHOLD_MS = 500;
+
+	// Only run aging check every N dequeues to reduce overhead
+	static constexpr idx_t AGING_CHECK_INTERVAL = 100;
 
 	// Per-query state: morsel counts and current priority level
 	unordered_map<uint64_t, idx_t> query_morsel_counts;
@@ -82,7 +90,7 @@ struct ConcurrentQueue {
 	idx_t GetTaskCountForProducer(ProducerToken &token) const;
 
 private:
-	// Must be called with queue_lock held
+	// Must be called with state_lock held
 	int GetQueryLevelLocked(uint64_t qid) {
 		auto it = query_priority_levels.find(qid);
 		return (it != query_priority_levels.end()) ? it->second : 0;
@@ -113,6 +121,7 @@ private:
 	}
 
 	atomic<idx_t> tasks_in_queue;
+	atomic<idx_t> dequeue_count;
 };
 
 struct QueueProducerToken {
@@ -122,17 +131,22 @@ struct QueueProducerToken {
 };
 
 void ConcurrentQueue::Enqueue(ProducerToken &token, shared_ptr<Task> task) {
-	// Use the producer token address as a stable unique query identifier
 	if (task->query_id == 0) {
 		task->query_id = reinterpret_cast<uint64_t>(&token);
 	}
 	task->token = token;
 	uint64_t qid = task->query_id;
 
+	// Read priority level under state_lock (separate from queue_lock)
+	int level;
 	{
-		lock_guard<mutex> lock(queue_lock);
-		int level = GetQueryLevelLocked(qid);
-		task->priority_level = level;
+		lock_guard<mutex> sl(state_lock);
+		level = GetQueryLevelLocked(qid);
+	}
+	task->priority_level = level;
+
+	{
+		lock_guard<mutex> ql(queue_lock);
 		TaskEntry entry = {&token, std::move(task), std::chrono::steady_clock::now()};
 		if (level == 0) {
 			q0.push_back(std::move(entry));
@@ -148,25 +162,36 @@ void ConcurrentQueue::Enqueue(ProducerToken &token, shared_ptr<Task> task) {
 
 void ConcurrentQueue::EnqueueBulk(ProducerToken &token, vector<shared_ptr<Task>> &tasks) {
 	typedef std::make_signed<std::size_t>::type ssize_t;
-	lock_guard<mutex> lock(queue_lock);
-	for (auto &task : tasks) {
-		if (task->query_id == 0) {
-			task->query_id = reinterpret_cast<uint64_t>(&token);
-		}
-		task->token = token;
-		uint64_t qid = task->query_id;
-		int level = GetQueryLevelLocked(qid);
-		task->priority_level = level;
-		TaskEntry entry = {&token, std::move(task), std::chrono::steady_clock::now()};
-		if (level == 0) {
-			q0.push_back(std::move(entry));
-		} else if (level == 1) {
-			q1.push_back(std::move(entry));
-		} else {
-			q2.push_back(std::move(entry));
+
+	// Read all levels under state_lock first, then enqueue under queue_lock
+	vector<int> levels(tasks.size());
+	{
+		lock_guard<mutex> sl(state_lock);
+		for (idx_t i = 0; i < tasks.size(); i++) {
+			if (tasks[i]->query_id == 0) {
+				tasks[i]->query_id = reinterpret_cast<uint64_t>(&token);
+			}
+			levels[i] = GetQueryLevelLocked(tasks[i]->query_id);
 		}
 	}
-	tasks_in_queue += tasks.size();
+
+	{
+		lock_guard<mutex> ql(queue_lock);
+		for (idx_t i = 0; i < tasks.size(); i++) {
+			auto &task = tasks[i];
+			task->token = token;
+			task->priority_level = levels[i];
+			TaskEntry entry = {&token, std::move(task), std::chrono::steady_clock::now()};
+			if (levels[i] == 0) {
+				q0.push_back(std::move(entry));
+			} else if (levels[i] == 1) {
+				q1.push_back(std::move(entry));
+			} else {
+				q2.push_back(std::move(entry));
+			}
+		}
+		tasks_in_queue += tasks.size();
+	}
 	semaphore.signal(NumericCast<ssize_t>(tasks.size()));
 }
 
@@ -188,7 +213,10 @@ bool ConcurrentQueue::DequeueFromProducer(ProducerToken &token, shared_ptr<Task>
 
 bool ConcurrentQueue::Dequeue(shared_ptr<Task> &task) {
 	lock_guard<mutex> lock(queue_lock);
-	AgeTasks(); // promote individual starving tasks before dequeuing
+	// Only run aging every AGING_CHECK_INTERVAL dequeues to reduce overhead
+	if (dequeue_count.fetch_add(1, std::memory_order_relaxed) % AGING_CHECK_INTERVAL == 0) {
+		AgeTasks();
+	}
 	// Always serve highest priority queue first
 	if (!q0.empty()) {
 		task = std::move(q0.front().task);
@@ -212,7 +240,8 @@ bool ConcurrentQueue::Dequeue(shared_ptr<Task> &task) {
 }
 
 void ConcurrentQueue::NotifyTaskComplete(uint64_t query_id) {
-	lock_guard<mutex> lock(queue_lock);
+	// Uses state_lock only — does not block Dequeue/Enqueue
+	lock_guard<mutex> sl(state_lock);
 	auto &count = query_morsel_counts[query_id];
 	count++;
 	auto &level = query_priority_levels[query_id];
