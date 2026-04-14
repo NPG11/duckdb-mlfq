@@ -12,6 +12,7 @@
 #include "duckdb/common/thread.hpp"
 #include "lightweightsemaphore.h"
 
+#include <deque>
 #include <thread>
 #else
 #include <queue>
@@ -38,7 +39,6 @@ struct SchedulerThread {
 };
 
 #ifndef DUCKDB_NO_THREADS
-typedef duckdb_moodycamel::ConcurrentQueue<shared_ptr<Task>> concurrent_queue_t;
 typedef duckdb_moodycamel::LightweightSemaphore lightweight_semaphore_t;
 
 struct ConcurrentQueue {
@@ -47,85 +47,172 @@ struct ConcurrentQueue {
 
 	lightweight_semaphore_t semaphore;
 
+	// MLFQ: three priority levels
+	// Q0 = high priority (new queries), Q1 = medium, Q2 = low (long-running)
+	using TaskEntry = pair<ProducerToken *, shared_ptr<Task>>;
+	std::deque<TaskEntry> q0;
+	std::deque<TaskEntry> q1;
+	std::deque<TaskEntry> q2;
+
+	mutable mutex queue_lock;
+
+	// Demotion thresholds (completed morsels before moving to next level)
+	static constexpr idx_t Q0_THRESHOLD = 50;
+	static constexpr idx_t Q1_THRESHOLD = 500;
+
+	// Per-query state: morsel counts and current priority level
+	unordered_map<uint64_t, idx_t> query_morsel_counts;
+	unordered_map<uint64_t, int> query_priority_levels;
+
 	void Enqueue(ProducerToken &token, shared_ptr<Task> task);
 	void EnqueueBulk(ProducerToken &token, vector<shared_ptr<Task>> &tasks);
 	bool DequeueFromProducer(ProducerToken &token, shared_ptr<Task> &task);
 	bool Dequeue(shared_ptr<Task> &task);
+	void NotifyTaskComplete(uint64_t query_id);
 	idx_t GetTasksInQueue() const;
 	idx_t GetApproxSize() const;
 	idx_t GetProducerCount() const;
 	idx_t GetTaskCountForProducer(ProducerToken &token) const;
-	concurrent_queue_t &GetQueue() {
-		return q;
-	}
 
 private:
-	concurrent_queue_t q;
+	// Must be called with queue_lock held
+	int GetQueryLevelLocked(uint64_t qid) {
+		auto it = query_priority_levels.find(qid);
+		return (it != query_priority_levels.end()) ? it->second : 0;
+	}
+
 	atomic<idx_t> tasks_in_queue;
 };
 
 struct QueueProducerToken {
-	explicit QueueProducerToken(ConcurrentQueue &queue) : queue_token(queue.GetQueue()) {
+	explicit QueueProducerToken(ConcurrentQueue &queue) {
+		// No per-producer lock-free token needed in MLFQ mode
 	}
-
-	duckdb_moodycamel::ProducerToken queue_token;
 };
 
 void ConcurrentQueue::Enqueue(ProducerToken &token, shared_ptr<Task> task) {
-	lock_guard<mutex> producer_lock(token.producer_lock);
-	task->token = token;
-	if (q.enqueue(token.token->queue_token, std::move(task))) {
-		++tasks_in_queue;
-		semaphore.signal();
-	} else {
-		throw InternalException("Could not schedule task!");
+	// Use the producer token address as a stable unique query identifier
+	if (task->query_id == 0) {
+		task->query_id = reinterpret_cast<uint64_t>(&token);
 	}
+	task->token = token;
+	uint64_t qid = task->query_id;
+
+	{
+		lock_guard<mutex> lock(queue_lock);
+		int level = GetQueryLevelLocked(qid);
+		task->priority_level = level;
+		if (level == 0) {
+			q0.push_back({&token, std::move(task)});
+		} else if (level == 1) {
+			q1.push_back({&token, std::move(task)});
+		} else {
+			q2.push_back({&token, std::move(task)});
+		}
+		++tasks_in_queue;
+	}
+	semaphore.signal();
 }
 
 void ConcurrentQueue::EnqueueBulk(ProducerToken &token, vector<shared_ptr<Task>> &tasks) {
 	typedef std::make_signed<std::size_t>::type ssize_t;
-	lock_guard<mutex> producer_lock(token.producer_lock);
+	lock_guard<mutex> lock(queue_lock);
 	for (auto &task : tasks) {
+		if (task->query_id == 0) {
+			task->query_id = reinterpret_cast<uint64_t>(&token);
+		}
 		task->token = token;
+		uint64_t qid = task->query_id;
+		int level = GetQueryLevelLocked(qid);
+		task->priority_level = level;
+		if (level == 0) {
+			q0.push_back({&token, std::move(task)});
+		} else if (level == 1) {
+			q1.push_back({&token, std::move(task)});
+		} else {
+			q2.push_back({&token, std::move(task)});
+		}
 	}
-	if (q.enqueue_bulk(token.token->queue_token, std::make_move_iterator(tasks.begin()), tasks.size())) {
-		tasks_in_queue += tasks.size();
-		semaphore.signal(NumericCast<ssize_t>(tasks.size()));
-	} else {
-		throw InternalException("Could not schedule tasks!");
-	}
+	tasks_in_queue += tasks.size();
+	semaphore.signal(NumericCast<ssize_t>(tasks.size()));
 }
 
 bool ConcurrentQueue::DequeueFromProducer(ProducerToken &token, shared_ptr<Task> &task) {
-	lock_guard<mutex> producer_lock(token.producer_lock);
-	if (!q.try_dequeue_from_producer(token.token->queue_token, task)) {
-		return false;
+	lock_guard<mutex> lock(queue_lock);
+	// Search priority queues in order, returning only tasks from this producer
+	for (auto *q : {&q0, &q1, &q2}) {
+		for (auto it = q->begin(); it != q->end(); ++it) {
+			if (it->first == &token) {
+				task = std::move(it->second);
+				q->erase(it);
+				--tasks_in_queue;
+				return true;
+			}
+		}
 	}
-	--tasks_in_queue;
-	return true;
+	return false;
 }
 
 bool ConcurrentQueue::Dequeue(shared_ptr<Task> &task) {
-	if (!q.try_dequeue(task)) {
-		return false;
+	lock_guard<mutex> lock(queue_lock);
+	// Always serve highest priority queue first
+	if (!q0.empty()) {
+		task = std::move(q0.front().second);
+		q0.pop_front();
+		--tasks_in_queue;
+		return true;
 	}
-	--tasks_in_queue;
-	return true;
+	if (!q1.empty()) {
+		task = std::move(q1.front().second);
+		q1.pop_front();
+		--tasks_in_queue;
+		return true;
+	}
+	if (!q2.empty()) {
+		task = std::move(q2.front().second);
+		q2.pop_front();
+		--tasks_in_queue;
+		return true;
+	}
+	return false;
+}
+
+void ConcurrentQueue::NotifyTaskComplete(uint64_t query_id) {
+	lock_guard<mutex> lock(queue_lock);
+	auto &count = query_morsel_counts[query_id];
+	count++;
+	auto &level = query_priority_levels[query_id];
+	if (level == 0 && count >= Q0_THRESHOLD) {
+		level = 1;
+	} else if (level == 1 && count >= Q1_THRESHOLD) {
+		level = 2;
+	}
 }
 
 idx_t ConcurrentQueue::GetTasksInQueue() const {
 	return tasks_in_queue;
 }
+
 idx_t ConcurrentQueue::GetApproxSize() const {
-	return q.size_approx();
+	lock_guard<mutex> lock(queue_lock);
+	return q0.size() + q1.size() + q2.size();
 }
+
 idx_t ConcurrentQueue::GetProducerCount() const {
-	return q.size_producers_approx();
+	return 0;
 }
 
 idx_t ConcurrentQueue::GetTaskCountForProducer(ProducerToken &token) const {
-	lock_guard<mutex> producer_lock(token.producer_lock);
-	return q.size_producer_approx(token.token->queue_token);
+	lock_guard<mutex> lock(queue_lock);
+	idx_t count = 0;
+	for (auto *q : {&q0, &q1, &q2}) {
+		for (auto &entry : *q) {
+			if (entry.first == &token) {
+				count++;
+			}
+		}
+	}
+	return count;
 }
 
 #else
@@ -307,12 +394,24 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 			auto execute_result = task->Execute(process_mode);
 
 			switch (execute_result) {
-			case TaskExecutionResult::TASK_FINISHED:
+			case TaskExecutionResult::TASK_FINISHED: {
+				// Update morsel count; may demote query to lower priority queue
+				uint64_t qid = task->query_id;
+				task.reset();
+				if (qid != 0) {
+					queue->NotifyTaskComplete(qid);
+				}
+				break;
+			}
 			case TaskExecutionResult::TASK_ERROR:
 				task.reset();
 				break;
 			case TaskExecutionResult::TASK_NOT_FINISHED: {
-				// task is not finished - reschedule immediately
+				// Partial morsel done — update count (demotion applies to re-enqueue)
+				uint64_t qid = task->query_id;
+				if (qid != 0) {
+					queue->NotifyTaskComplete(qid);
+				}
 				auto &token = *task->token;
 				queue->Enqueue(token, std::move(task));
 				break;
