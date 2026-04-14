@@ -42,7 +42,7 @@ struct SchedulerThread {
 typedef duckdb_moodycamel::LightweightSemaphore lightweight_semaphore_t;
 
 struct ConcurrentQueue {
-	ConcurrentQueue() : tasks_in_queue(0) {
+	ConcurrentQueue() : tasks_in_queue(0), last_boost_time(std::chrono::steady_clock::now()) {
 	}
 
 	lightweight_semaphore_t semaphore;
@@ -59,6 +59,10 @@ struct ConcurrentQueue {
 	// Demotion thresholds (completed morsels before moving to next level)
 	static constexpr idx_t Q0_THRESHOLD = 50;
 	static constexpr idx_t Q1_THRESHOLD = 500;
+
+	// Starvation prevention: boost all queries back to Q0 every interval
+	static constexpr int64_t BOOST_INTERVAL_MS = 1000; // 1 second
+	std::chrono::steady_clock::time_point last_boost_time;
 
 	// Per-query state: morsel counts and current priority level
 	unordered_map<uint64_t, idx_t> query_morsel_counts;
@@ -79,6 +83,31 @@ private:
 	int GetQueryLevelLocked(uint64_t qid) {
 		auto it = query_priority_levels.find(qid);
 		return (it != query_priority_levels.end()) ? it->second : 0;
+	}
+
+	// Boost all demoted tasks back to Q0 to prevent starvation.
+	// Must be called with queue_lock held.
+	void BoostIfNeeded() {
+		auto now = std::chrono::steady_clock::now();
+		auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_boost_time).count();
+		if (elapsed < BOOST_INTERVAL_MS) {
+			return;
+		}
+		// Move all Q1 and Q2 tasks back to Q0
+		for (auto &entry : q1) {
+			entry.second->priority_level = 0;
+			q0.push_back(std::move(entry));
+		}
+		q1.clear();
+		for (auto &entry : q2) {
+			entry.second->priority_level = 0;
+			q0.push_back(std::move(entry));
+		}
+		q2.clear();
+		// Reset per-query state so queries get a fresh start
+		query_morsel_counts.clear();
+		query_priority_levels.clear();
+		last_boost_time = now;
 	}
 
 	atomic<idx_t> tasks_in_queue;
@@ -155,6 +184,7 @@ bool ConcurrentQueue::DequeueFromProducer(ProducerToken &token, shared_ptr<Task>
 
 bool ConcurrentQueue::Dequeue(shared_ptr<Task> &task) {
 	lock_guard<mutex> lock(queue_lock);
+	BoostIfNeeded(); // prevent starvation of long-running queries
 	// Always serve highest priority queue first
 	if (!q0.empty()) {
 		task = std::move(q0.front().second);
