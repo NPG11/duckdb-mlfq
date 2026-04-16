@@ -25,12 +25,24 @@ std::mutex file_mutex;
 void run_elephant(DuckDB &db, std::string scenario_name) {
     Connection con(db);
     std::vector<BenchResult> local_results;
-    
-    
+
+    // TPC-H Q1: full lineitem scan with 6 aggregations (official elephant query)
     std::string elephant_query = R"(
-        SELECT l_returnflag, l_linestatus, sum(l_quantity) as sum_qty, count(*) as count_order
-        FROM lineitem WHERE l_shipdate <= date '1998-12-01' - interval '90' day
-        GROUP BY l_returnflag, l_linestatus;
+        SELECT
+            l_returnflag,
+            l_linestatus,
+            sum(l_quantity) AS sum_qty,
+            sum(l_extendedprice) AS sum_base_price,
+            sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+            sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+            avg(l_quantity) AS avg_qty,
+            avg(l_extendedprice) AS avg_price,
+            avg(l_discount) AS avg_disc,
+            count(*) AS count_order
+        FROM lineitem
+        WHERE l_shipdate <= CAST('1998-09-02' AS date)
+        GROUP BY l_returnflag, l_linestatus
+        ORDER BY l_returnflag, l_linestatus;
     )";
     
     while (keep_running) {
@@ -53,13 +65,43 @@ void run_elephant(DuckDB &db, std::string scenario_name) {
 void run_mouse(DuckDB &db, std::string scenario_name, int delay_ms) {
     Connection con(db);
     std::vector<BenchResult> local_results;
-    
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> distr(1, 1500000); 
-    
+
+    // Official TPC-H mice queries: Q6, Q14, Q22 — selective, fast, low resource usage
+    static const std::string mouse_queries[] = {
+        // TPC-H Q6: single lineitem scan, tight filters — fastest TPC-H query
+        R"(SELECT sum(l_extendedprice * l_discount) AS revenue
+           FROM lineitem
+           WHERE l_shipdate >= CAST('1994-01-01' AS date)
+             AND l_shipdate < CAST('1995-01-01' AS date)
+             AND l_discount BETWEEN 0.05 AND 0.07
+             AND l_quantity < 24;)",
+
+        // TPC-H Q14: lineitem-part join, narrow 1-month date window
+        R"(SELECT 100.00 * sum(CASE WHEN p_type LIKE 'PROMO%'
+               THEN l_extendedprice * (1 - l_discount) ELSE 0 END)
+               / sum(l_extendedprice * (1 - l_discount)) AS promo_revenue
+           FROM lineitem, part
+           WHERE l_partkey = p_partkey
+             AND l_shipdate >= CAST('1995-09-01' AS date)
+             AND l_shipdate < CAST('1995-10-01' AS date);)",
+
+        // TPC-H Q22: customer table only, small aggregation
+        R"(SELECT cntrycode, count(*) AS numcust, sum(c_acctbal) AS totacctbal
+           FROM (SELECT substring(c_phone FROM 1 FOR 2) AS cntrycode, c_acctbal
+                 FROM customer
+                 WHERE substring(c_phone FROM 1 FOR 2) IN ('13','31','23','29','30','18','17')
+                   AND c_acctbal > (SELECT avg(c_acctbal) FROM customer
+                                    WHERE c_acctbal > 0.00
+                                      AND substring(c_phone FROM 1 FOR 2) IN ('13','31','23','29','30','18','17'))
+                   AND NOT EXISTS (SELECT * FROM orders WHERE o_custkey = c_custkey)) AS custsale
+           GROUP BY cntrycode ORDER BY cntrycode;)"
+    };
+
+    int query_idx = 0;
     while (keep_running) {
-        std::string mouse_query = "SELECT * FROM orders WHERE o_orderkey = " + std::to_string(distr(gen)) + ";";
+        // Rotate through Q6, Q14, Q22
+        std::string mouse_query = mouse_queries[query_idx % 3];
+        query_idx++;
 
         auto start = high_resolution_clock::now();
         con.Query(mouse_query);
@@ -119,7 +161,7 @@ int main() {
 
     DuckDB db("tpch-sf1.db"); 
     Connection setup_con(db);
-    setup_con.Query("PRAGMA threads=2;");
+    setup_con.Query("PRAGMA threads=4;");
     
     // Define runtime per scenario (300 seconds = 5 minutes)
     int RUN_TIME = 30; 
