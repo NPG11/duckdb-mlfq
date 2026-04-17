@@ -65,9 +65,12 @@ struct ConcurrentQueue {
 	mutable mutex queue_lock;
 	mutable mutex state_lock;
 
-	// Demotion thresholds (completed tasks before moving to next level)
-	static constexpr idx_t Q0_THRESHOLD = 8;
-	static constexpr idx_t Q1_THRESHOLD = 40;
+	// Demotion thresholds (completed tasks before moving to next level).
+	// Q0_THRESHOLD is set above the morsel count of a single mouse query (~600–800
+	// morsels at SF=10) so that mice always complete in Q0, while elephant queries
+	// (Q1: ~10 000 morsels) get demoted to Q1 and then Q2.
+	static constexpr idx_t Q0_THRESHOLD = 1000;
+	static constexpr idx_t Q1_THRESHOLD = 5000;
 
 	// Aging threshold: promote a task if it has waited longer than this
 	static constexpr int64_t AGING_THRESHOLD_MS = 500;
@@ -173,11 +176,29 @@ void ConcurrentQueue::EnqueueBulk(ProducerToken &token, vector<shared_ptr<Task>>
 	vector<int> levels(tasks.size());
 	{
 		lock_guard<mutex> sl(state_lock);
+		// Determine the query_id for this bulk (all tasks share the same connection token)
+		uint64_t bulk_qid = 0;
 		for (idx_t i = 0; i < tasks.size(); i++) {
 			if (tasks[i]->query_id == 0) {
 				tasks[i]->query_id = reinterpret_cast<uint64_t>(&token);
 			}
-			levels[i] = GetQueryLevelLocked(tasks[i]->query_id);
+			bulk_qid = tasks[i]->query_id;
+		}
+		// Reset: each EnqueueBulk represents a new query or pipeline phase.
+		// This prevents morsel counts from accumulating across query executions
+		// on the same connection (same ProducerToken = same query_id).
+		if (bulk_qid != 0) {
+			auto prev_level = query_priority_levels[bulk_qid];
+			auto prev_count = query_morsel_counts[bulk_qid];
+			query_morsel_counts[bulk_qid] = 0;
+			query_priority_levels[bulk_qid] = 0;
+			if (prev_level > 0) {
+				std::fprintf(stderr, "[MLFQ] NEW_QUERY: query %llu reset to Q0 (was Q%d after %llu morsels)\n",
+				             (unsigned long long)bulk_qid, prev_level, (unsigned long long)prev_count);
+			}
+		}
+		for (idx_t i = 0; i < tasks.size(); i++) {
+			levels[i] = 0; // all start at Q0 after reset
 		}
 	}
 
