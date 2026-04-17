@@ -12,6 +12,7 @@
 #include "duckdb/common/thread.hpp"
 #include "lightweightsemaphore.h"
 
+#include <cstdio>
 #include <deque>
 #include <thread>
 #else
@@ -64,10 +65,9 @@ struct ConcurrentQueue {
 	mutable mutex queue_lock;
 	mutable mutex state_lock;
 
-	// Demotion thresholds (completed morsels before moving to next level)
-	// Raised to avoid over-eager demotion under heavy load
-	static constexpr idx_t Q0_THRESHOLD = 200;
-	static constexpr idx_t Q1_THRESHOLD = 2000;
+	// Demotion thresholds (completed tasks before moving to next level)
+	static constexpr idx_t Q0_THRESHOLD = 8;
+	static constexpr idx_t Q1_THRESHOLD = 40;
 
 	// Aging threshold: promote a task if it has waited longer than this
 	static constexpr int64_t AGING_THRESHOLD_MS = 500;
@@ -104,6 +104,9 @@ private:
 		if (!q1.empty()) {
 			auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(now - q1.front().enqueue_time).count();
 			if (wait >= AGING_THRESHOLD_MS) {
+				uint64_t qid = q1.front().task->query_id;
+				std::fprintf(stderr, "[MLFQ] AGING: query %llu promoted Q1 -> Q0 (waited %lldms)\n",
+				             (unsigned long long)qid, (long long)wait);
 				q1.front().task->priority_level = 0;
 				q0.push_back(std::move(q1.front()));
 				q1.pop_front();
@@ -113,6 +116,9 @@ private:
 		if (!q2.empty()) {
 			auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(now - q2.front().enqueue_time).count();
 			if (wait >= AGING_THRESHOLD_MS) {
+				uint64_t qid = q2.front().task->query_id;
+				std::fprintf(stderr, "[MLFQ] AGING: query %llu promoted Q2 -> Q0 (waited %lldms)\n",
+				             (unsigned long long)qid, (long long)wait);
 				q2.front().task->priority_level = 0;
 				q0.push_back(std::move(q2.front()));
 				q2.pop_front();
@@ -245,10 +251,19 @@ void ConcurrentQueue::NotifyTaskComplete(uint64_t query_id) {
 	auto &count = query_morsel_counts[query_id];
 	count++;
 	auto &level = query_priority_levels[query_id];
+	// Log morsel progress every 10 completions
+	if (count % 10 == 0) {
+		std::fprintf(stderr, "[MLFQ] PROGRESS: query %llu morsels=%llu level=Q%d\n",
+		             (unsigned long long)query_id, (unsigned long long)count, level);
+	}
 	if (level == 0 && count >= Q0_THRESHOLD) {
 		level = 1;
+		std::fprintf(stderr, "[MLFQ] DEMOTE: query %llu Q0 -> Q1 (morsels: %llu)\n",
+		             (unsigned long long)query_id, (unsigned long long)count);
 	} else if (level == 1 && count >= Q1_THRESHOLD) {
 		level = 2;
+		std::fprintf(stderr, "[MLFQ] DEMOTE: query %llu Q1 -> Q2 (morsels: %llu)\n",
+		             (unsigned long long)query_id, (unsigned long long)count);
 	}
 }
 

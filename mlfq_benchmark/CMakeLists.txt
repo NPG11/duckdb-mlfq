@@ -9,8 +9,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(DUCKDB_DIR "../")
 include_directories(${DUCKDB_DIR}/src/include)
 
-# Assuming you built DuckDB in release mode (make release)
-link_directories(${DUCKDB_DIR}/build/release/src)
+# Windows: built with cmake --build build --config Release
+link_directories(${DUCKDB_DIR}/build/src/Release)
 
 add_executable(mlfq_bench main.cpp)
 
