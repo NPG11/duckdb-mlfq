@@ -4,9 +4,27 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 
-mlfq_csv    = 'mlfq_latency_results.csv'
-vanilla_csv = 'C:/Users/neelg/duckdb-mlfq/mlfq_benchmark/vanilla_sf10_results.csv'
-output      = 'comparison_latest_graph.png'
+import os, sys
+
+# Vanilla CSV: check next to this script first, then fall back to saved SF=10 results
+script_dir  = os.path.dirname(os.path.abspath(__file__))
+mlfq_csv    = os.path.join(script_dir, 'build_win', 'Release', 'mlfq_latency_results.csv')
+vanilla_csv = os.path.join(script_dir, 'vanilla_results.csv')
+
+if not os.path.exists(vanilla_csv):
+    vanilla_csv = os.path.join(script_dir, 'vanilla_sf10_results.csv')
+
+if not os.path.exists(vanilla_csv):
+    print("ERROR: No vanilla results CSV found. Run run_benchmark.py first and rename output to vanilla_results.csv")
+    sys.exit(1)
+
+if not os.path.exists(mlfq_csv):
+    print("ERROR: No MLFQ results CSV found. Run mlfq_bench.exe first.")
+    sys.exit(1)
+
+print(f"MLFQ results:    {mlfq_csv}")
+print(f"Vanilla results: {vanilla_csv}")
+output = os.path.join(script_dir, 'comparison_latest_graph.png')
 
 mlfq    = pd.read_csv(mlfq_csv);    mlfq['Latency_ms']    = mlfq['Latency_Microseconds']    / 1000.0
 vanilla = pd.read_csv(vanilla_csv); vanilla['Latency_ms'] = vanilla['Latency_Microseconds'] / 1000.0
